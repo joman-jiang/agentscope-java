@@ -7,7 +7,7 @@ zh_link: /v2/zh/docs/harness/subagent
 
 ## Role
 
-Let the parent delegate "independent, context-heavy, parallelizable" tasks so it doesn't bloat its own loop. Each subagent is a transient instance (a local `HarnessAgent` or a remote stub), with its own session, returning a result via tool result.
+Let the parent delegate "independent, context-heavy, parallelizable" tasks so it doesn't bloat its own loop. Each subagent (a local `HarnessAgent` or a remote stub) runs its own conversation, separate from the parent's: every invocation — a spawn with a task, or a follow-up `agent_send` — runs to completion and returns that invocation's result (as the sync tool result, or pushed back for background tasks). A live local subagent keeps its own history across follow-up sends; remote backends may start a new conversation for each send. Session persistence and later resumption depend on the declaration (`persistSession`) and the backend — see [Persistent sessions](#persistent-sessions).
 
 ## A minimal example
 
@@ -103,6 +103,33 @@ When enabled, a new ordinary message repairs orphaned pending tool calls with sy
 results, including calls loaded from a failed session. Pending permission confirmations still
 require confirmation; empty-input resume and caller-supplied tool results retain their existing
 behavior. Remote agents and custom factories configure recovery themselves.
+
+### Per-subagent compaction
+
+Local declarations inherit the parent's compaction configuration and enabled state by default.
+Set `compaction: false` in a workspace spec to disable it for one subagent, or `compaction: true`
+to use the default configuration even when the parent disables compaction. A mapping selects an
+independent configuration; omitted fields use `CompactionConfig` defaults:
+
+```yaml
+compaction:
+  triggerMessages: 20
+  keepMessages: 5
+  keepTokens: 0
+  flushBeforeCompact: false
+```
+
+Supported mapping fields are `triggerMessages`, `triggerTokens`, `reserved`, `keepMessages`,
+`keepTokens`, `keepTokensMin`, `keepTokensMax`, `keepTokensRatio`, `summaryPrompt`,
+and `flushBeforeCompact`. Field names are case-sensitive. Invalid types
+or unknown fields produce a warning; the subagent remains available and inherits the parent's
+compaction settings. An absent or null `compaction` also inherits the parent.
+
+In Java, use `.compaction(config)` or `.disableCompaction()` on `SubagentDeclaration.Builder`.
+The last call wins; `.compaction(null)` restores inheritance. Java configurations also support
+custom models, pruning, and argument truncation. These settings apply only to local subagents;
+remote subagents manage their own compaction, so a `compaction` value on a remote declaration is
+ignored.
 
 ### Custom factories
 

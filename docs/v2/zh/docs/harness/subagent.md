@@ -6,7 +6,7 @@ en_link: /v2/en/docs/harness/subagent
 
 ## 作用
 
-让主 agent 把"可独立处理、上下文重、可并行"的任务委派出去，避免主线程膨胀。每个子 agent 都是一个临时实例（本地的 `HarnessAgent` 或远程 stub），跑自己的会话，结果通过工具返回给父 agent。
+让主 agent 把"可独立处理、上下文重、可并行"的任务委派出去，避免主线程膨胀。每个子 agent（本地 `HarnessAgent` 或远程 stub）跑自己的会话，与父对话相互独立：每次调用——带任务的 spawn，或 `agent_send` follow-up——都完整跑完并返回本次调用的结果（同步走工具结果，后台任务经推送回传）。存活的本地子 agent 在 follow-up send 之间保留自己的历史；远端后端可能为每次 send 开启新对话。会话持久化与后续恢复取决于声明（`persistSession`）和后端——见[持久会话](#持久会话)。
 
 ## 一个最小例子
 
@@ -101,6 +101,29 @@ HarnessAgent.builder()
 `enablePendingToolRecovery` 写法。开启后，新的普通消息会为悬空工具调用补充错误结果，
 也适用于从失败会话中重新加载的工具调用。等待人工审批的工具仍须提供审批结果；空输入恢复执行、
 调用方补交工具结果的行为保持原有语义。远端 agent 和自定义工厂需自行配置恢复策略。
+
+### 为子 agent 单独配置压缩
+
+本地声明默认继承父 agent 的压缩配置和启用状态。在工作区规格中设置 `compaction: false`
+可单独禁用压缩；`compaction: true` 使用默认配置，即使父 agent 已禁用压缩也会启用。
+映射形式用于指定独立配置，省略的字段使用 `CompactionConfig` 默认值：
+
+```yaml
+compaction:
+  triggerMessages: 20
+  keepMessages: 5
+  keepTokens: 0
+  flushBeforeCompact: false
+```
+
+支持的字段包括 `triggerMessages`、`triggerTokens`、`reserved`、`keepMessages`、
+`keepTokens`、`keepTokensMin`、`keepTokensMax`、`keepTokensRatio`、`summaryPrompt`、
+和 `flushBeforeCompact`。字段名区分大小写。类型错误或未知字段会记录警告，
+但子 agent 声明仍会加载，并继承父 agent 的压缩配置。省略 `compaction` 或设置为 null 时也继承父配置。
+
+Java 中可调用 `SubagentDeclaration.Builder` 的 `.compaction(config)` 或 `.disableCompaction()`，
+最后一次调用生效；`.compaction(null)` 恢复继承。Java 配置还支持自定义模型、剪枝和参数截断。
+这些设置仅适用于本地子 agent。远程子 agent 自行管理压缩，远程声明中的 `compaction` 设置会被忽略。
 
 ### 自定义工厂
 
