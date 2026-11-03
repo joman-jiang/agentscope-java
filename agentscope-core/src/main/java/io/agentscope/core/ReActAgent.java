@@ -169,6 +169,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -566,16 +567,26 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
         AgentState toSave = scope.state;
         return Mono.<Void>fromRunnable(
                         () -> {
-                            long newVersion =
-                                    persistAgentStateCas(
-                                            ref.userId,
-                                            ref.sessionId,
-                                            scope.slotKey,
-                                            toSave,
-                                            scope.loadedVersion,
-                                            scope.loadedContextSize);
-                            if (newVersion != AgentStateStore.UNVERSIONED) {
-                                scope.loadedVersion = newVersion;
+                            CompletableFuture<Void> write = scope.beginStateWrite();
+                            if (write == null) {
+                                // The call was cancelled before this write started; a cancelled
+                                // call no longer owns the session, so it must not write it.
+                                return;
+                            }
+                            try {
+                                long newVersion =
+                                        persistAgentStateCas(
+                                                ref.userId,
+                                                ref.sessionId,
+                                                scope.slotKey,
+                                                toSave,
+                                                scope.loadedVersion,
+                                                scope.loadedContextSize);
+                                if (newVersion != AgentStateStore.UNVERSIONED) {
+                                    scope.loadedVersion = newVersion;
+                                }
+                            } finally {
+                                write.complete(null);
                             }
                         })
                 .subscribeOn(Schedulers.boundedElastic());
@@ -912,7 +923,12 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
     protected Mono<Void> releaseCallExecution(Object scope, String status) {
         if (!(scope instanceof CallExecution ce)) return Mono.empty();
         SessionRecorder recorder = SessionRecorder.from(ce.rc);
-        if (recorder == null) return Mono.empty();
+        if (recorder == null) {
+            // Cancelling cannot abort a state write already running on boundedElastic. Hold the
+            // session gate until it lands, so the next same-session call loads after it instead
+            // of being overwritten by it.
+            return "cancelled".equals(status) ? Mono.defer(ce::closeStateWrites) : Mono.empty();
+        }
         return Mono.fromRunnable(
                         () -> {
                             SessionExecution execution = SessionExecution.from(ce.rc);
@@ -2085,6 +2101,42 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
         /** Context size at load time; used by {@link ConflictPolicy#APPEND_MERGE}. */
         int loadedContextSize;
 
+        /** Guards {@link #stateWriteInFlight} and {@link #stateWritesClosed}. */
+        private final Object stateWriteLock = new Object();
+
+        /** Last state write started by this call; already complete when none is running. */
+        private CompletableFuture<Void> stateWriteInFlight =
+                CompletableFuture.completedFuture(null);
+
+        /** Set once the call is cancelled: no further state writes may start. */
+        private boolean stateWritesClosed;
+
+        /**
+         * Registers a state write about to start.
+         *
+         * @return the future to complete when the write ends, or {@code null} when the call has
+         *     been cancelled and must not write
+         */
+        CompletableFuture<Void> beginStateWrite() {
+            synchronized (stateWriteLock) {
+                if (stateWritesClosed) {
+                    return null;
+                }
+                stateWriteInFlight = new CompletableFuture<>();
+                return stateWriteInFlight;
+            }
+        }
+
+        /** Stops new state writes and completes once the write already running (if any) ends. */
+        Mono<Void> closeStateWrites() {
+            CompletableFuture<Void> running;
+            synchronized (stateWriteLock) {
+                stateWritesClosed = true;
+                running = stateWriteInFlight;
+            }
+            return Mono.fromFuture(running, true);
+        }
+
         /**
          * Per-call system message, propagated across PreCallEvent → PreReasoningEvent /
          * PreSummaryEvent. Owned by a single logical execution: seeded to {@code null} at call
@@ -3127,7 +3179,10 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
             return Flux.defer(
                     () -> {
                         String callId = UUID.randomUUID().toString().replace("-", "");
-                        return prepareRequest(mci, callId, ModelRequestPreparer.Purpose.REASONING)
+                        return prepareRequest(
+                                        appendTransientSoToolReminder(mci),
+                                        callId,
+                                        ModelRequestPreparer.Purpose.REASONING)
                                 .flatMapMany(
                                         prepared ->
                                                 preparedModelCallStream(
@@ -3176,6 +3231,8 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
          * Appends the structured-output reminder to a request-local copy of the model input. The
          * reminder never enters {@code state.contextMutable()}, so hooks, middleware, session
          * persistence, and subsequent calls observe only the caller's real messages.
+         * With final preparation enabled, keep the reminder separate so canonical history remains
+         * unchanged for compaction's history comparison.
          */
         private ModelCallInput appendTransientSoToolReminder(ModelCallInput input) {
             if (soTool == null) {
@@ -3185,13 +3242,25 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
             List<Msg> messages = new ArrayList<>(input.messages());
             TextBlock reminder = TextBlock.builder().text(soToolReminderText()).build();
             int lastIndex = messages.size() - 1;
-            if (lastIndex >= 0 && messages.get(lastIndex).getRole() == MsgRole.USER) {
+            if (modelRequestPreparer == null
+                    && lastIndex >= 0
+                    && messages.get(lastIndex).getRole() == MsgRole.USER) {
                 Msg last = messages.get(lastIndex);
                 List<ContentBlock> content = new ArrayList<>(last.getContent());
                 content.add(reminder);
                 messages.set(lastIndex, last.withContent(List.copyOf(content)));
             } else {
-                messages.add(UserMessage.builder().name("user").content(List.of(reminder)).build());
+                UserMessage.Builder reminderBuilder =
+                        UserMessage.builder().name("user").content(List.of(reminder));
+                if (modelRequestPreparer != null) {
+                    reminderBuilder.metadata(
+                            Map.of(
+                                    Msg.METADATA_SYNTHETIC,
+                                    true,
+                                    Msg.METADATA_REMINDER_KIND,
+                                    "structured_output"));
+                }
+                messages.add(reminderBuilder.build());
             }
 
             List<ToolSchema> tools = input.tools();
@@ -3216,12 +3285,11 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
 
         private Flux<AgentEvent> preparedModelCallStream(
                 ReasoningContext context,
-                ModelCallInput modelCallInput,
+                ModelCallInput mci,
                 boolean withToolEvents,
                 String replyId) {
 
             ModelCallBlockLifecycle blockLifecycle = new ModelCallBlockLifecycle(replyId);
-            ModelCallInput mci = appendTransientSoToolReminder(modelCallInput);
 
             Flux<AgentEvent> modelEvents =
                     Flux.defer(
